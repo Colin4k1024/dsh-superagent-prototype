@@ -182,7 +182,7 @@ Each kind has a health entry under its name. It reports an error once one of its
 
 ### Sources
 
-Sources extend the host through `SourceKind`, defined in `src/sources/kind.ts`. A kind declares its identity, title, description, configuration `schema` and `fields`, derived `facts`, and `health` entries. Optional behavior includes `scope`, a `channel` (`allowed`, `send`, `link`), `threadContext`, `find`, `policy`, `environment` and `refreshLabels`.
+Sources extend the host through `SourceKind`, defined in `src/sources/kind.ts`. A kind declares its identity, title, description, configuration `schema` and `fields`, derived `facts`, and `health` entries. Optional behavior includes `scope`, a `channel` (`allowed`, `send`, `link`), `threadContext`, `find`, `policy`, `environment`, `refreshLabels` and `capabilities`, whose `forge` is the code-host capability a kind publishes to the generic layer.
 
 `SourceRegistry` (`registry.ts`) owns registered kinds and stored instances, and implements the Engine's `SourceScope`. Registration claims health entries on `HealthBoard`; duplicate claims and reserved `sync:` names are refused. A SourceContext writes only through its registration's claimed entries, so reports after unregistration do nothing.
 
@@ -333,6 +333,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
+| `src/app/merge-gate.ts` | The host merge gate: approvals, pipeline, size, sensitive paths and head SHA |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
 | `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext` |
@@ -358,10 +359,17 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/paths.ts` | The package's root, where packaged files are |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
-| `src/sources/kind.ts` | The `SourceKind` protocol |
+| `src/sources/kind.ts` | The `SourceKind` protocol and its optional capabilities |
+| `src/sources/forge.ts` | `ForgePort`, `ChangeBinding` and `ChangeSnapshot`: what a Source kind publishes about its code host |
 | `src/sources/registry.ts` | `SourceRegistry` |
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
+| `src/sources/github-forge.ts` | The GitHub `ForgePort`: the existing pull-request, check and repository rules behind the source-neutral change interface |
+| `src/sources/gitlab.ts` | The GitLab kind and plugin entry, exported as `./gitlab-watch`: configuration, fields, health and the Phase 2 polling placeholder |
+| `src/sources/gitlab-read.ts` | GitLab project reads: Issues/MRs by `updated_after`, notes, discussions, approvals and pending todos |
+| `src/sources/gitlab-mr.ts` | GitLab MR binding, lifecycle observation, terminal notices and the MR snapshot |
+| `src/sources/gitlab-trigger.ts` | GitLab Issues, merge requests, notes, approvals and pipelines as Triggers, their Threads and Channel addresses |
+| `src/sources/gitlab-channel.ts` | The GitLab Channel: Issue/MR notes, discussion replies, marker idempotency and quick-action escaping |
 | `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: a poll round of notifications, the pull requests of open Tickets with their CI, and subscribed Threads |
 | `src/sources/github-trigger.ts` | GitHub comments, reviews, Issue bodies and CI changes as Triggers, and GitHub addresses |
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
@@ -407,7 +415,21 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
-| `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
+| `tests/forge.spec.ts` | A Source kind's code-host capability on `SourceRegistry` |
+| `tests/github-forge.spec.ts` | The GitHub `ForgePort`: thread parsing, page URLs, followed change numbers and terminal notices |
+| `tests/gitlab.spec.ts` | The GitLab kind skeleton: configuration defaults, fields, Thread parsing, environment values and health |
+| `tests/gitlab-trigger.spec.ts` | GitLab Trigger translation: Issue/MR bodies, notes, DiffNotes, approvals, actors and mentions |
+| `tests/gitlab-channel.spec.ts` | The GitLab Channel: project paths, marker idempotency, discussion replies, gone/retry and quick actions |
+| `tests/gitlab-mr.spec.ts` | GitLab MR binding, merged/closed observation, snapshot and terminal notices |
+| `tests/gitlab-poll.spec.ts` | GitLab reads and one polling round: note filtering, stream cursors and Trigger intake |
+| `tests/gitlab-ci.spec.ts` | GitLab CI/repository reads: counts, the checks interface, repository files/tree and Thread context |
+| `tests/merge-gate.spec.ts` | The host merge gate: approvals, draft, pipeline, mergeability, size, sensitive paths and head SHA |
+| `tests/gitlab-review-gate.spec.ts` | The GitLab review gate: approvals, size, sensitive paths, drafts and the small glob |
+| `tests/gitlab-mention-canary.spec.ts` | The GitLab mention canary's dry-run plan |
+| `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, mention sweep and quarantine, the pull request rules, health |
+| `tests/review-gate.spec.ts` | The review gate's size, sensitive-path and latest-approval rules, and its glob matcher |
+| `tests/session-preflight.spec.ts` | The startup preflight that quarantines backup and corrupt session directories |
+| `tests/mention-canary.spec.ts` | The live mention canary's dry-run plan |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |

@@ -21,8 +21,8 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 ## Prerequisites
 
 - Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+ and tmux
-- GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
-- A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
+- A code-host CLI: GitHub CLI (`gh`) 2.48 or later, or GitLab CLI (`glab`) with `glab api`. Source CLI fields must point to wrappers; the host relies on their subcommands and output formats.
+- A repository on github.com or a GitLab project on gitlab.com/self-managed. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
 
@@ -45,6 +45,22 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
    ```
 
    Sign in as the agent account; the last command prints its login. dsh-superagent reads the login the same way.
+
+### GitLab instead of GitHub
+
+1. Enable the `dsh-superagent-gitlab` plugin row and disable `dsh-superagent-github`; the Setup refuses both enabled
+   (`twoCodeHosts`).
+2. Create a **project access token** with the Developer role and `api` + `write_repository` for the agent, and a `glab`
+   wrapper that sets `GLAB_CONFIG_DIR` to the agent's own configuration. Keep a second Maintainer token/CLI for
+   `mergeCli` (the host merge tool); do not expose it to workers.
+3. For a self-managed instance, point `GLAB_CA_CERT` and `GIT_SSL_CAINFO` at the same CA bundle and verify `git ls-remote`
+   as the agent before saving.
+4. On the GitLab Source card, set the instance host, `group/subgroup/project`, the agent `glab` wrapper, the commit email,
+   and optionally the host `mergeCli`. Setup probes `/user` and `/projects/:encoded` and requires at least Developer.
+5. Add `examples/gitlab/review-gate.mjs` and `.gitlab-ci.yml` job, then run
+   `scripts/apply-gitlab-review-gate.sh --project GROUP/PROJECT`. The Review gate document (009) has the GitLab section.
+6. Set the execution environment's prepare command to clone from the GitLab URL; the worker's git credential is the
+   GitLab host's, not github.com's.
 
 ### Feishu bot (optional)
 
