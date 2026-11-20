@@ -8,7 +8,7 @@ import { checkedImText } from '../infra/text.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { Deployment } from '../deployment.ts'
 import { admissionContext } from '../sources/admission-context.ts'
-import { readRepositoryPath } from '../sources/github-read.ts'
+import type { RepositoryRead } from '../sources/forge.ts'
 import type { TriggerContext } from '../sources/kind.ts'
 import { relatedTickets } from './cards.ts'
 import { textPage } from './context.ts'
@@ -58,6 +58,8 @@ export interface AssessorHost {
   paused(): boolean
   /** Thread context reader for `trigger`'s Source, or `undefined` when the Source has none. */
   threadContext(trigger: Trigger): TriggerContext | undefined
+  /** Repository reader for `trigger`'s Source, or `undefined` when the Source has none, such as Feishu. */
+  repository(trigger: Trigger): RepositoryRead | undefined
   /** Delivers a candidate card to the main Session once per request ID, resolving after the Session receives it. */
   deliver(requestId: string, text: string): Promise<void>
   candidateCard(candidate: Candidate): Promise<Record<string, unknown>>
@@ -263,7 +265,9 @@ export class MasterAssessor implements Assessor {
         body = JSON.stringify({ images: references, next_read: next, ...result.body })
       }
       else {
-        body = await readRepositoryPath(commands, read.path!, read.resource === 'directory' ? 'directory' : 'file')
+        const reader = this.host.repository(trigger)
+        if (!reader) throw new Error('This Source offers no repository reads')
+        body = await reader.read(commands, read.path!, read.resource === 'directory' ? 'directory' : 'file')
       }
       snapshots.set(cacheKey, body)
       return textPage(read.resource, body, read.offset, 4000)

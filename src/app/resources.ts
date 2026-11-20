@@ -7,7 +7,7 @@ import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
 import { feishuRef } from '../sources/feishu.ts'
 import { feishuTriggerId } from '../sources/feishu-trigger.ts'
 import { ASSIGNMENTS, INPUTS, assignmentLine, decisionCard, decisionDetails, inputLine, newestPage, preview, textPage, threadCard, ticketCard,
-  ticketDetails, triggerCard, type TicketThread } from './cards.ts'
+  ticketDetails, triggerCard, type TicketChange, type TicketThread } from './cards.ts'
 import { threadTitle } from './views/records.ts'
 import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
@@ -64,6 +64,8 @@ export interface ResourceHost {
   readonly masterId: string
   readonly context: Context
   promptVersion(sessionId: string): PromptVersion
+  /** The ticket's change projection, resolved by the application from the Source registry. */
+  changes(ticket: Ticket): TicketChange | undefined
   /** Whether a Session may read `revision` (the revision it currently runs under or any revision it ran under previously). */
   mayRead(sessionId: string, revision: number): boolean
   feishuPageSize(): number
@@ -118,7 +120,7 @@ async function transcript(host: ResourceHost, ticketId: string) {
 const ROUTES: readonly Route[] = [
   ['tickets', read => {
     const host = main(read), tickets = host.store.tickets.list()
-    const card = (ticket: Ticket) => ({ ...ticketCard(ticket), ...host.sessions.modelRetry(runningAssignment(ticket) && workerSessionId(ticket.id)) })
+    const card = (ticket: Ticket) => ({ ...ticketCard(ticket, host.changes(ticket)), ...host.sessions.modelRetry(runningAssignment(ticket) && workerSessionId(ticket.id)) })
     return list(read, (offset, count) => tickets.slice(offset, offset + count).map(card))
   }],
   ['triggers', read => {
@@ -143,7 +145,7 @@ const ROUTES: readonly Route[] = [
     const page = list(read, (offset, count) => store.read.threadPage(thread.key, offset, count).map(triggerLine))
     // Worker sessions cannot inspect other tickets or decisions on a shared thread.
     if (ticketId) return { ...card, ...page }
-    const tickets = ids.flatMap(id => { const found = store.tickets.get(id); return found ? [ticketCard(found)] : [] })
+    const tickets = ids.flatMap(id => { const found = store.tickets.get(id); return found ? [ticketCard(found, host.changes(found))] : [] })
     const decisions = store.decisions.byThread(thread.key).slice(-THREAD_DECISIONS).reverse().map(decisionCard)
     return { ...card, tickets, decisions, ...page }
   }],
@@ -249,7 +251,7 @@ const ROUTES: readonly Route[] = [
         ({ thread: key, ...context ? { context: true } : {}, ...bound.has(key) ? { bound: true } : {} })
       const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(id))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
-      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry }
+      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId, host.changes(ticket)), ...retry }
     }
     if (section === 'assignments' || section === 'inputs') {
       if (part !== undefined) throw new Error('Unknown context resource')

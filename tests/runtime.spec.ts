@@ -327,7 +327,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
   expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_attention', ticket: { ticket_id: ticket.id, attention: { question: 'Desktop too?' } } })
   await expect(runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'other', text: 'x' })).rejects.toThrow('current attention question')
   expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'Desktop too?', text: '要不要也改桌面端？' })).toEqual({ status: 'sent' })
-  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 42, human_action: null })
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', change_number: 42, human_action: null })
   const bound = runtime.store.tickets.get(ticket.id)!
   expect(pullOf(bound)).toBe(42)
   expect(bound.attention).toBeUndefined()
@@ -1064,15 +1064,15 @@ it('passes team text with template braces to every Session literally, without re
   }
 })
 
-it('leaves auto-merge to the delivery requirements, with the agent\'s own gh and the line threshold', async () => {
+it('routes merging through the host gate, never through the worker\'s own CLI or auto-merge', async () => {
   const { ticket } = await acceptedTicket()
-  expect(runtime.ticketEnvironment(ticket).map(variable => variable.key)).not.toContain('DSH_SUPERAGENT_GITHUB_MERGE_ACCOUNT')
+  expect(runtime.ticketEnvironment(ticket).map(variable => variable.key)).not.toContain('DSH_SUPERAGENT_GITLAB_MERGE_ACCOUNT')
   expect(ticket.mandate).not.toHaveProperty('autoMergeLineLimit')
   const delivery = runtime.prompts.current().config.delivery
-  expect(delivery).toContain('it changes fewer than 200 lines (additions plus deletions);')
-  // Auto-merge is never enabled as the agent account; only a merge CLI the section names enables it.
-  expect(delivery).toContain('Never enable auto-merge as the agent account')
-  expect(delivery).toContain('<merge CLI> pr merge <number> --auto --merge --match-head-commit <sha>')
+  expect(delivery).toContain('orchestrator_merge_request')
+  expect(delivery).toContain('Never call `glab mr merge` yourself')
+  expect(delivery).toContain('merge gate')
+  expect(delivery).not.toContain('auto-merge for the head commit')
   expect(runtime.prompts.preview(runtime.prompts.current().config).worker).not.toContain('gh-merge')
 })
 
@@ -1131,13 +1131,13 @@ it('runs a GitHub-only deployment: the GitHub part of the Policy decides alone, 
 })
 
 
-it('credits each human reviewer once in the default delivery requirements on every commit of the PR, never with an empty commit', async () => {
+it('credits each human reviewer once in the default delivery requirements, without inventing an email', async () => {
   const delivery = runtime.prompts.current().config.delivery
-  expect(delivery).toContain('Co-authored-by: <name or login> <id+login@users.noreply.github.com>')
-  expect(delivery).toContain('on every commit of the PR branch')
-  expect(delivery).toContain('git filter-branch -f --msg-filter')
-  expect(delivery).toContain('Never push an empty commit to credit a reviewer.')
+  expect(delivery).toContain('Co-authored-by')
+  expect(delivery).toContain('Reviewed-by: @<username>')
+  expect(delivery).toContain('do not invent an email')
   expect(delivery).toContain('Do not credit bots')
+  expect(delivery).not.toContain('filter-branch')
 })
 
 it('shows a failed reply as a problem with its attempts, an error of the reply effects after three, until it is withdrawn', async () => {

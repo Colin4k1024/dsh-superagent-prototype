@@ -2,6 +2,8 @@
 import { liveTicket, type Thread } from '../core/index.ts'
 import type { SourceContext } from './host.ts'
 
+/** A failed notification read kept for the next round: its Thread, whether it is a pull request, and its retry state. */
+export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
 /** How long a subscribed Thread with no live Ticket continues to be polled after its last Trigger or Ticket end. */
 export const POLL_HORIZON_MS = 14 * 24 * 3600_000
 /** True when a subscribed thread has a live ticket or recent activity/completion within `POLL_HORIZON_MS`. */
@@ -12,8 +14,12 @@ export function polled(ctx: SourceContext, thread: Thread, now = Date.now()): bo
     .map(Date.parse).filter(Number.isFinite)
   return now - Math.max(...times) < POLL_HORIZON_MS
 }
-/** Steps a poll start timestamp back by 5 seconds so late-arriving remote events are not missed; deterministic trigger IDs deduplicate overlaps. */
-export const cursorAt = (started: string): string => new Date(Date.parse(started) - 5000).toISOString()
+/**
+ * Steps a poll start timestamp back by 5 seconds so late-arriving remote events are not missed; deterministic trigger IDs
+ * deduplicate overlaps. A caller whose remote index can lag passes a larger overlap (for example a mention lookback), so a
+ * comment that became visible after the previous cursor still falls inside the next read.
+ */
+export const cursorAt = (started: string, overlapMs = 5000): string => new Date(Date.parse(started) - overlapMs).toISOString()
 /** Polls each subscribed Thread of `source` within the horizon independently; records failures on the Thread as `pollError` (unless `stopped()`) and clears `pollError` on success. */
 export async function pollThreads(ctx: SourceContext, source: string, stopped: () => boolean, poll: (thread: Thread) => Promise<void>,
   skip: (thread: Thread) => boolean = () => false): Promise<void> {

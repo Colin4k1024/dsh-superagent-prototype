@@ -2,21 +2,26 @@
 import { z } from 'zod'
 import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
-import { claimPull, readPull } from '../../sources/github-pull.ts'
-import type { SourceContext } from '../../sources/host.ts'
+import type { ForgeTarget } from '../../sources/forge.ts'
+import type { SourceRegistry } from '../../sources/registry.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
+import { ticketChange } from '../cards.ts'
 import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
+import { mergeGate } from '../merge-gate.ts'
+import { KV } from '../../kv.ts'
 import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
   readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
-  readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
+  readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic' | 'set'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
   readonly resources: ResourceHost
-  /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
-  readonly github: SourceContext
+  /** The deployment's Sources, for projecting a ticket's change into its card and notices. */
+  readonly sources: Pick<SourceRegistry, 'forges'>
+  /** Resolves a ticket's code host and the context its Forge methods need; undefined for a ticket with no code host. */
+  readonly changes: { for(ticket: Ticket): ForgeTarget | undefined }
   sendReplies(): Promise<void>
 }
 
@@ -79,26 +84,58 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         summary: z.string().min(1),
         human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
-        pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
+        change_number: z.number().int().positive().nullish()
+          .describe('The ticket\'s change (PR/MR): its source change, or one the agent opened from a branch named after this ticket (DSH_SUPERAGENT_NAME). Omit when there is no change.'),
+        pr_number: z.number().int().positive().nullish().describe('Deprecated alias of change_number; accepted for sessions started before the rename.'),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
       }).strict(),
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
-        const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
-        // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
+        const requested = args.change_number ?? args.pr_number
+        const target = requested == null ? undefined : host.changes.for(current)
+        if (requested != null && !target) throw new Error('This ticket has no code host; omit change_number')
+        const change = target && requested != null
+          ? await target.forge.change.read(target.context, { kind: 'change', number: requested }, signal) : undefined
+        // Claim the change, record the report, and queue the relay atomically so a rejected claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
         return host.store.atomic(() => {
-          const refused = pull && claimPull(host.github, ticketId, pull)
+          const refused = change && target ? target.forge.change.claim(target.context, ticketId, change) : undefined
           if (refused) throw new Error(refused)
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           const updated = host.engine.report(ticketId, report)
-          const relay = reportRelay(updated, report)
+          const relay = reportRelay(updated, report, ticketChange(updated, host.sources))
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'
           return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
         })
+      },
+    }),
+    tool({
+      name: 'orchestrator_merge_request',
+      description: 'Merge this ticket\'s MR through the host gate: it must be open, non-draft, mergeable, with a successful pipeline and an approval by someone other than its author. Use after the reviews the delivery requirements name.',
+      schema: z.object({
+        change_number: z.number().int().positive().optional().describe('The MR to merge; defaults to the open MR this ticket follows.'),
+        head_sha: z.string().min(1).optional().describe('The head SHA the reviewer approved; the gate refuses when the MR head differs.'),
+        evidence: z.string().trim().min(1).max(1000).describe('Why this MR is ready: the approvals and pipeline result you read.'),
+      }).strict(),
+      execute: async (args, signal) => {
+        const current = host.store.tickets.get(ticketId)
+        if (!current || !liveTicket(current)) throw new Error('Ticket ended (MR was closed or work finished); do not resume it')
+        const target = host.changes.for(current)
+        if (!target?.forge.change.merge) throw new Error('This ticket\'s Source has no host merge')
+        const number = args.change_number ?? target.forge.change.numbersOf(current, true).at(-1)
+        if (!number) throw new Error('No open merge request to merge; report ready with change_number first')
+        const change = await target.forge.change.read(target.context, { kind: 'change', number }, signal)
+        const gate = mergeGate(change, args.head_sha ? { sha: args.head_sha } : {})
+        if (!gate.ok) throw new Error(gate.reason)
+        await target.forge.change.merge(target.context, change, args.head_sha ? { sha: args.head_sha } : {})
+        const at = new Date().toISOString()
+        host.store.set(KV.gitlab.merge(number), { at, ticketId, approvedBy: change.approvals?.approvedBy ?? [],
+          pipeline: change.pipeline?.status ?? '', sha: change.headSha ?? '', evidence: args.evidence })
+        return { merged: true, change_number: number, sha: change.headSha, approved_by: change.approvals?.approvedBy ?? [],
+          pipeline: change.pipeline?.status ?? '' }
       },
     }),
   ]

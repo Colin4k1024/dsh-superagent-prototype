@@ -1,7 +1,7 @@
 /** Compact, bounded model-facing projections of triggers, tickets, threads, and decisions; full texts stay behind readable resources. */
-import { latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
+import { latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type Text, type Thread, type Ticket, type TicketInput,
   type Trigger, type TriggerDisposition } from '../core/index.ts'
-import { pullOf } from '../sources/github-pull.ts'
+import type { ForgePort } from '../sources/forge.ts'
 import { batchLine, inputResource } from '../executor/dsh.ts'
 
 /** Collapses whitespace and truncates text for display previews while keeping code, angle brackets, and links intact for model readers. */
@@ -23,11 +23,26 @@ function cardState(ticket: Ticket): TicketCardState {
   if (stage.stage === 'person') return `person/${stage.action}`
   return stage.stage === 'idle' ? 'idle' : stage.stage === 'working' && stage.action ? 'working/queued' : 'working'
 }
-export function ticketCard(ticket: Ticket) {
+/** The change a ticket follows, as a card shows it: which Source and number, and the word that Source uses. */
+export interface TicketChange { source: string; number: number; word: Text }
+/** What ticketChange needs from SourceRegistry; the registry satisfies it without cards importing the registry. */
+export interface ChangeLookup { forges(): readonly { source: string; forge: ForgePort }[] }
+/** The last open change a ticket follows, else its last closed one; undefined for a ticket with no code-host change. */
+export function ticketChange(ticket: Pick<Ticket, 'follows'>, lookup: ChangeLookup): TicketChange | undefined {
+  const found = (ticket.follows ?? []).flatMap(follow => lookup.forges().flatMap(({ source, forge }) => {
+    const ref = forge.change.parse(follow.thread)
+    return ref ? [{ source, number: ref.number, word: forge.changeWord, closed: !!follow.closed }] : []
+  }))
+  const chosen = found.findLast(item => !item.closed) ?? found.at(-1)
+  return chosen ? { source: chosen.source, number: chosen.number, word: chosen.word } : undefined
+}
+/** A ticket's card; `change` is the change projection its caller resolved, so this stays independent of any code host. */
+export function ticketCard(ticket: Ticket, change?: TicketChange) {
   const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, reason: ticket.ended.reason ?? ticket.ended.outcome }
   const { attention } = ticket
+  const changeCard = change ? change.source === 'github' ? { pr_number: change.number } : { change_number: change.number } : {}
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
-    ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
+    ...changeCard, ...(ended ? { ended } : {}),
     ...(attention ? { attention: { question: attention.question, ...attention.triggerId ? { trigger_id: attention.triggerId } : {} } } : {}),
     preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }
 }
@@ -57,9 +72,9 @@ export function newestPage<T, L>(items: readonly T[], offset: number, size: numb
 }
 export interface TicketThread { thread: string; context?: true; bound?: true }
 /** Projects a ticket with its linked triggers, threads, and first pages of assignments and inputs, omitting decision IDs for workers. */
-export function ticketDetails(ticket: Ticket, threads: TicketThread[], batch: readonly Trigger[], worker = false) {
+export function ticketDetails(ticket: Ticket, threads: TicketThread[], batch: readonly Trigger[], worker = false, change?: TicketChange) {
   // Drop card preview because the latest report's preview is already shown on the first assignment entry.
-  const { preview: _preview, ...card } = ticketCard(ticket)
+  const { preview: _preview, ...card } = ticketCard(ticket, change)
   return { ...card, trigger_id: ticket.origin.triggerId, ...batch.length ? { batch: batch.map(batchLine) } : {},
     ...worker ? {} : { decision_id: ticket.decisionId }, threads, directory: ticket.execution?.directory,
     scope: ticket.mandate.scope, requested_by: ticket.mandate.actor.id,
@@ -92,5 +107,5 @@ export function textPage(resource: string, text: string, offset: number, limit: 
 }
 export function relatedTickets(tickets: readonly Ticket[]) {
   const order = [...tickets].sort((a, b) => Number(!a.ended) === Number(!b.ended) ? b.createdAt.localeCompare(a.createdAt) : a.ended ? 1 : -1)
-  return { related_tickets: order.slice(0, 8).map(ticketCard), tickets_total: tickets.length }
+  return { related_tickets: order.slice(0, 8).map(ticket => ticketCard(ticket)), tickets_total: tickets.length }
 }

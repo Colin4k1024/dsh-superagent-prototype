@@ -5,14 +5,15 @@ import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
 import { ciCounts, ciFact, ciFailures, ciSummary, githubThreadContext, pullChecks } from './github-read.ts'
-import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, issueTrigger, IssueSchema, pullTrigger, SOURCE }
+import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, issueTrigger, IssueSchema, mentions, pullTrigger, SOURCE }
   from './github-trigger.ts'
 import { githubLink, sendGithub } from './github-channel.ts'
 import type { GithubComment, PullRef } from './github-trigger.ts'
 import { observePull, pullsOf, readPull, type Pull } from './github-pull.ts'
+import { githubForge } from './github-forge.ts'
 import { health, sourceContext, type Health, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
-import { cursorAt, pause, POLL_HORIZON_MS, pollThreads as pollEach } from './poll.ts'
+import { cursorAt, pause, POLL_HORIZON_MS, pollThreads as pollEach, type Retry } from './poll.ts'
 import type { Localized, SourceKind } from './kind.ts'
 import { z } from 'zod'
 
@@ -24,6 +25,8 @@ const NotificationSchema = z.looseObject({
 
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
+  mentionLookbackSeconds: z.number().int().min(60).max(3600).default(900),
+  threadFailuresBeforeQuarantine: z.number().int().min(2).max(10).default(3),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
   observeCi: z.boolean().default(false) }).strict()
 export type GithubConfig = z.infer<typeof GithubConfigSchema>
@@ -47,6 +50,8 @@ export const githubKind: SourceKind<GithubConfig> = {
       hint: { zh: '命令名或绝对路径，通常是用 GH_CONFIG_DIR 登录智能体账号的 gh 包装脚本。智能体以它登录的账号行事，执行器以 gh 调用它。保存时检查它登录的账号能否推送到仓库，然后重启 dsh-superagent。', en: 'A command name or absolute path, usually a gh wrapper signed in to the agent account through GH_CONFIG_DIR. The agent acts as the account it is signed in to, and the Executor calls it as gh. Saving checks that this account can push to the repository, then restarts dsh-superagent.' } },
     { key: 'pollSeconds', type: 'number', advanced: true, min: 60, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' }, hint: { zh: 'GitHub 要求更长间隔时以 GitHub 为准。', en: 'A longer interval requested by GitHub wins.' } },
     { key: 'failuresBeforeError', type: 'number', advanced: true, min: 1, max: 20, label: { zh: '连续失败几次后报告异常', en: 'Failed polls before reporting an error' }, hint: { zh: '单次网络中断会在下一次轮询时自动重试，不必报告。', en: 'A single network interruption is retried on the next poll and need not be reported.' } },
+    { key: 'mentionLookbackSeconds', type: 'number', advanced: true, min: 60, max: 3600, label: { zh: '提及回看窗口 / 秒', en: 'Mention lookback / seconds' }, hint: { zh: '通知游标和提及扫描至少回看这么久，覆盖 GitHub 通知索引延迟；Trigger ID 会去重重复读取。默认 900 秒。', en: 'The notification cursor and mention sweep look back at least this far to cover GitHub notification indexing delay; Trigger IDs deduplicate repeated reads. Default 900 seconds.' } },
+    { key: 'threadFailuresBeforeQuarantine', type: 'number', advanced: true, min: 2, max: 10, label: { zh: '线程连续失败几次后隔离', en: 'Thread failures before quarantine' }, hint: { zh: '订阅的 Issue/PR 连续返回 404 等错误达到这个次数后停止轮询并在健康里记为隔离，避免一个删除的线程长期污染全局健康。新提及会恢复它。', en: 'After this many consecutive 404-style failures a subscribed Issue/PR stops being polled and is named as quarantined in health, so one deleted thread cannot keep the whole Source red. A new mention resumes it.' } },
     { key: 'observeIssues', type: 'switch', label: { zh: '接收仓库里的新 Issue', en: 'Receive new Issues in the repository' },
       hint: { zh: '打开后，没有 @ 智能体的新 Issue 也会收到，由策略的接收表决定是否成为候选。从打开的时候开始，不读以前的。', en: 'New Issues that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates. Starts when switched on; earlier ones are not read.' } },
     { key: 'observePulls', type: 'switch', label: { zh: '接收仓库里的新 PR', en: 'Receive new pull requests in the repository' },
@@ -61,6 +66,7 @@ export const githubKind: SourceKind<GithubConfig> = {
     return { listened: true, observed: row !== undefined && config[OBSERVED[row]], ...row ? { row } : {} }
   },
   health: ['github'],
+  capabilities: { forge: githubForge },
   channel: { send: sendGithub, link: githubLink },
   threadContext: githubThreadContext,
   // `#12`, `12`, or the page of an Issue or PR, of any repository, names Thread 12.
@@ -146,13 +152,12 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
 }
 interface Round {
   started: string; signal?: AbortSignal | undefined
-  pulls: Map<number, Promise<Pull>>; read: Set<number>; failures: string[]; dropped: number[]; abandoned: number[]
-  tally: Tally
+  pulls: Map<number, Promise<Pull>>; read: Set<number>; failures: string[]; dropped: number[]; abandoned: number[]; quarantined: number[]
+  warnings: string[]; tally: Tally
 }
 const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOString(), signal, pulls: new Map(), read: new Set(),
-  failures: [], dropped: [], abandoned: [], tally: { skipped: 0 } })
+  failures: [], dropped: [], abandoned: [], quarantined: [], warnings: [], tally: { skipped: 0 } })
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
-export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
 const RETRY_WINDOW_MS = 24 * 3600_000
 /** True when GitHub returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
 const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
@@ -281,6 +286,10 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   const round = newRound(signal)
   const notified = await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
   await pollRepository(ctx, round)
+  // A repository-wide mention sweep is the fallback for GitHub's notification index: notifications can become visible after
+  // the `since` cursor has already moved past them, and a deleted notification thread cannot be retried forever.
+  const config = ctx.config<GithubConfig>(SOURCE)
+  if (config) await pollMentionSweep(ctx, round, config)
   await pollTicketPulls(ctx, signal, round)
   await pollThreads(ctx, signal, round)
   if ('error' in notified) throw notified.error
@@ -289,7 +298,9 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   if (round.failures.length) throw new Error(`${round.failures.length} GitHub reads failed: ${round.failures.slice(0, 3).join('; ')}`)
   const named = (numbers: number[]) => [...new Set(numbers)].sort((a, b) => a - b).map(number => `#${number}`).join(', ')
   const dropped = (round.dropped.length ? `; deleted on GitHub: ${named(round.dropped)}` : '')
+    + (round.quarantined.length ? `; quarantined after repeated reads failed: ${named(round.quarantined)}` : '')
     + (round.abandoned.length ? `; dropped after their reads kept failing: ${named(round.abandoned)}` : '')
+    + (round.warnings.length ? `; sweep warnings: ${round.warnings.slice(0, 2).join('; ')}` : '')
     + (round.tally.skipped ? `; ${round.tally.skipped} unreadable items skipped` : '')
   ctx.report('github', { state: 'ready', detail: `${count} notifications; next poll ≥ ${interval}s${dropped}`, at: round.started })
   return interval
@@ -298,7 +309,8 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
 async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ count: number; interval: number }> {
   const { state } = ctx
   const commands = ctx.commands.withSignal(round.signal)
-  const since = state.get(KV.github.since) ?? round.started
+  const lookbackMs = (ctx.config<GithubConfig>(SOURCE)?.mentionLookbackSeconds ?? 900) * 1000
+  const since = state.get(KV.github.since) ?? cursorAt(round.started, lookbackMs)
   if (state.get(KV.github.since) === undefined) state.set(KV.github.since, since)
   const { repository } = ctx.deployment
   const path = `notifications?all=true&per_page=50&since=${encodeURIComponent(since)}`
@@ -331,6 +343,16 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
     } catch (error) {
       if (stopped(ctx, round)) return { count: notifications.length, interval }
       const retry = { ...item, failedAt: item.failedAt ?? round.started, attempts: (item.attempts ?? 0) + 1 }
+      // A 404 on a notification thread can mean a deleted Issue (permanent) or revoked access to a private repository (temporary).
+      // Retry a few times, then quarantine the thread so one unreadable item cannot keep the whole Source in error forever.
+      const notFound = error instanceof CliError && error.code === 404
+      const quarantineAfter = ctx.config<GithubConfig>(SOURCE)?.threadFailuresBeforeQuarantine ?? 3
+      if (notFound && retry.attempts >= quarantineAfter) {
+        round.quarantined.push(number)
+        ctx.threads.patch(`github:${number}`, { pollError: String(error), pollFailures: retry.attempts, pollSuspended: true, pollSuspendedAt: round.started })
+        delete retries[number]
+        continue
+      }
       // Abandon notification retries after 24 hours of failures so a permanently unreadable thread does not hold source health in error; its cursor stays so a later notification or thread poll still reads what was missed.
       const abandoned = Date.parse(round.started) - Date.parse(retry.failedAt) >= RETRY_WINDOW_MS
       failed(ctx, round, number, error, abandoned)
@@ -338,7 +360,7 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
       delete retries[number]
     }
   }
-  ctx.atomic(() => { state.set(KV.github.since, cursorAt(round.started)); state.set(KV.github.retries, retries) })
+  ctx.atomic(() => { state.set(KV.github.since, cursorAt(round.started, lookbackMs)); state.set(KV.github.retries, retries) })
   return { count: notifications.length, interval }
 }
 async function readNotified(ctx: SourceContext, round: Round, number: number, item: Retry): Promise<void> {
@@ -369,8 +391,10 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
     await intakeComments(ctx, { number, isPr: true, url: pr.html_url, prAuthor: pr.user.login }, since, round)
     if (pr.title) nameThread(ctx, number, pr.title)
   }
-  ctx.state.set(KV.github.cursor(number), cursorAt(round.started))
-  ctx.threads.patch(`github:${number}`, { pollError: undefined })
+  const lookbackMs = (ctx.config<GithubConfig>(SOURCE)?.mentionLookbackSeconds ?? 900) * 1000
+  ctx.state.set(KV.github.cursor(number), cursorAt(round.started, lookbackMs))
+  // A freshly notified human message proves the thread is readable again; resume a quarantined thread.
+  ctx.threads.patch(`github:${number}`, { pollError: undefined, pollFailures: undefined, pollSuspended: undefined, pollSuspendedAt: undefined })
 }
 /** Reads and observes a PR at most once per polling round. */
 function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
@@ -426,16 +450,80 @@ function nameThread(ctx: SourceContext, number: number, title: string): void {
   ctx.threads.patch(`github:${number}`, { title })
   ctx.threads.describe(`github:${number}`, { label: `#${number} ${title}`, facts: { number: { value: `#${number}` } } })
 }
+/**
+ * Repository-wide mention sweep, independent of the notification index. GitHub notifications can appear after the `since`
+ * cursor has moved past their comment, and a notification thread that cannot be read is retried rather than skipped. This
+ * sweep asks the repository's conversation and inline-comment lists for recent comments and ingests only the ones that
+ * mention the agent, so a lost notification becomes a Trigger on the next poll. Trigger IDs deduplicate against the normal
+ * notification and stream paths; a sweep failure is a warning, not a Source failure.
+ */
+async function pollMentionSweep(ctx: SourceContext, round: Round, config: GithubConfig): Promise<void> {
+  const since = new Date(Date.parse(round.started) - config.mentionLookbackSeconds * 1000).toISOString()
+  const { login } = ctx.deployment.github
+  const commands = ctx.commands.withSignal(round.signal)
+  const lists = [
+    { path: `issues/comments?sort=updated&direction=desc&per_page=100&since=${encodeURIComponent(since)}`, kind: 'conversation' as const },
+    { path: `pulls/comments?sort=updated&direction=desc&per_page=100&since=${encodeURIComponent(since)}`, kind: 'inline' as const },
+  ]
+  for (const list of lists) {
+    try {
+      const comments = await commands.pages(ListedSchema, list.path, round.tally)
+      for (const comment of comments) {
+        if (stopped(ctx, round)) return
+        const at = Date.parse(comment.updated_at ?? comment.created_at ?? '')
+        if (!Number.isFinite(at) || at < Date.parse(since)) continue
+        if (sameName(comment.user.login, login)) continue
+        if (!mentions(comment.body ?? '', login)) continue
+        const raw = (list.kind === 'inline' ? comment.pull_request_url : comment.issue_url) ?? comment.html_url ?? ''
+        const number = Number(/\/(?:issues|pulls)\/(\d+)$/.exec(raw)?.[1])
+        if (!number) { round.tally.skipped += 1; continue }
+        const isPr = list.kind === 'inline' || /\/pull\//.test(comment.html_url ?? '') || /\/pulls\//.test(raw)
+        const trigger = commentTrigger(comment, { number, isPr, ...(comment.html_url ? { url: comment.html_url } : {}) }, list.kind, login)
+        // The notification or repository stream may already have stored this exact comment; its ID is deterministic.
+        if (!trigger.text || ctx.triggers.get(trigger.id)) continue
+        await ctx.receive(trigger)
+      }
+    } catch (error) {
+      if (stopped(ctx, round)) throw error
+      round.warnings.push(`mention sweep ${list.path.split('?')[0]}: ${String(error)}`)
+    }
+  }
+}
+/** True when a Thread was quarantined and no newer Trigger has arrived to prove it readable again. */
+function suspended(ctx: SourceContext, thread: Thread): boolean {
+  if (thread.meta.pollSuspended !== true) return false
+  const at = Date.parse(String(thread.meta.pollSuspendedAt ?? ''))
+  const last = Date.parse(thread.lastAt ?? thread.createdAt)
+  if (Number.isFinite(at) && Number.isFinite(last) && last > at) {
+    ctx.threads.patch(thread.key, { pollSuspended: undefined, pollSuspendedAt: undefined, pollFailures: undefined })
+    return false
+  }
+  return true
+}
 /** Polls subscribed Issue and PR Threads not already read in this round; a deleted (410) Issue is still polled within the horizon (costing one read) and does not fail the round. */
 export async function pollThreads(ctx: SourceContext, signal?: AbortSignal, round = newRound(signal)): Promise<void> {
   await pollEach(ctx, SOURCE, () => stopped(ctx, round), async thread => {
     try { await pollThread(ctx, round, thread) }
     catch (error) {
       if (stopped(ctx, round)) throw error
-      if (deleted(error)) round.dropped.push(Number(thread.ref.id)); else round.failures.push(`${thread.key}: ${String(error)}`)
+      const failures = Number(thread.meta.pollFailures ?? 0) + 1
+      const notFound = error instanceof CliError && error.code === 404
+      const quarantineAfter = ctx.config<GithubConfig>(SOURCE)?.threadFailuresBeforeQuarantine ?? 3
+      if (notFound && failures >= quarantineAfter) {
+        // A deleted Issue (404) and revoked access to a private repository share the same status. Quarantine after a few
+        // attempts so one permanently unreadable Thread cannot keep the whole Source red; a new mention resumes it.
+        round.quarantined.push(Number(thread.ref.id))
+        ctx.threads.patch(thread.key, { pollError: String(error), pollFailures: failures, pollSuspended: true, pollSuspendedAt: round.started })
+      } else if (deleted(error)) {
+        round.dropped.push(Number(thread.ref.id))
+        ctx.threads.patch(thread.key, { pollFailures: failures })
+      } else {
+        round.failures.push(`${thread.key}: ${String(error)}`)
+        ctx.threads.patch(thread.key, { pollFailures: failures })
+      }
       throw error
     }
-  }, thread => round.read.has(Number(thread.ref.id)))
+  }, thread => round.read.has(Number(thread.ref.id)) || suspended(ctx, thread))
 }
 async function pollThread(ctx: SourceContext, round: Round, thread: Thread): Promise<void> {
   // The default branch's CI Thread has no Issue or PR to read; its CI arrives as Triggers.
@@ -455,5 +543,6 @@ async function pollThread(ctx: SourceContext, round: Round, thread: Thread): Pro
     const pr = await pull(ctx, round, number)
     await intakeComments(ctx, { number, isPr: true, url: pr.html_url, prAuthor: pr.user.login }, since, round)
   } else await intakeComments(ctx, { number, isPr: false }, since, round)
-  ctx.state.set(checkpoint, cursorAt(round.started))
+  ctx.state.set(checkpoint, cursorAt(round.started, (ctx.config<GithubConfig>(SOURCE)?.mentionLookbackSeconds ?? 900) * 1000))
+  ctx.threads.patch(thread.key, { pollError: undefined, pollFailures: undefined, pollSuspended: undefined, pollSuspendedAt: undefined })
 }
