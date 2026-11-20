@@ -213,3 +213,22 @@ it('stops a running command when the signal of its work aborts, or the lifetime,
   await expect(other).rejects.toThrow()
   expect(Date.now() - started).toBeLessThan(4000)
 })
+
+describe('GitLab API transport', () => {
+  const gitlabDeployment = testDeployment({
+    github: { cli: '', login: '', noreply: '' },
+    forge: { kind: 'gitlab', repository: 'group/app', cli: '/path/glab', login: 'agent-bot', commitEmail: '', host: 'https://gitlab.example.com', projectId: 42 },
+    gitlab: { host: 'https://gitlab.example.com', project: 'group/app', projectId: 42, cli: '/path/glab', login: 'agent-bot', commitEmail: '' },
+  })
+
+  it('scopes calls to the project and reads one flat paginated array', async () => {
+    const commands = new Commands(() => gitlabDeployment, {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run').mockResolvedValue(JSON.stringify([{ iid: 1 }, { iid: 2 }]))
+    expect(await commands.gitlabPages(z.object({ iid: z.number() }), 'issues?per_page=2')).toEqual([{ iid: 1 }, { iid: 2 }])
+    expect(run).toHaveBeenCalledWith('/path/glab', ['api', 'projects/42/issues?per_page=2', '--paginate'])
+    run.mockResolvedValue(JSON.stringify({ iid: 7 }))
+    expect(await commands.gitlab(z.object({ iid: z.number() }), 'merge_requests/7')).toEqual({ iid: 7 })
+    expect(run).toHaveBeenLastCalledWith('/path/glab', ['api', 'projects/42/merge_requests/7'])
+    await expect(commands.gitlab('projects/../x')).rejects.toThrow('restricted to the configured project')
+  })
+})

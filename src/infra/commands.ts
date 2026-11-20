@@ -97,6 +97,47 @@ export class Commands {
     return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
   }
   /**
+   * Calls the GitLab API on a path within the configured project, validating JSON output when a schema is provided
+   * or returning raw CLI output (such as `--include` headers) when omitted.
+   * @throws CliError with GitLab's HTTP status as `code` on failure.
+   */
+  async gitlab<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
+  async gitlab(path: string, ...flags: string[]): Promise<string>
+  async gitlab<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
+    if (typeof schema === 'string') return this.run(this.deployment.forge.cli, ['api', this.gitlabPath(schema), ...rest])
+    const [path = '', ...flags] = rest
+    return schema.parse(JSON.parse(await this.run(this.deployment.forge.cli, ['api', this.gitlabPath(path), ...flags])))
+  }
+  /** Fetches all pages of a GitLab API list, whose `--paginate` output is one flat JSON array. */
+  async gitlabPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
+    const output = await this.run(this.deployment.forge.cli, ['api', this.gitlabPath(path), '--paginate'])
+    return validItems(item, z.array(z.unknown()).parse(JSON.parse(output)), tally)
+  }
+  /** Calls a GitLab API path outside the project, such as `todos`, `user` or `events`, with the same validation. */
+  async gitlabRoot<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
+  async gitlabRoot(path: string, ...flags: string[]): Promise<string>
+  async gitlabRoot<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
+    if (typeof schema === 'string') return this.run(this.deployment.forge.cli, ['api', this.rootPath(schema), ...rest])
+    const [path = '', ...flags] = rest
+    return schema.parse(JSON.parse(await this.run(this.deployment.forge.cli, ['api', this.rootPath(path), ...flags])))
+  }
+  /** Fetches all pages of a root GitLab list, such as the pending todos. */
+  async gitlabRootPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
+    const output = await this.run(this.deployment.forge.cli, ['api', this.rootPath(path), '--paginate'])
+    return validItems(item, z.array(z.unknown()).parse(JSON.parse(output)), tally)
+  }
+  private rootPath(path: string): string {
+    const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
+    if (outside) throw new Error('GitLab calls are restricted to API paths')
+    return path
+  }
+  private gitlabPath(path: string): string {
+    const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
+    if (outside) throw new Error('GitLab calls are restricted to the configured project')
+    const project = this.deployment.gitlab?.projectId ?? encodeURIComponent(this.repository)
+    return path ? `projects/${project}/${path}` : `projects/${project}`
+  }
+  /**
    * Runs the Feishu bot's `lark-cli` and returns the JSON `data` payload.
    * @throws CliError with Feishu's error code on failure (rewriting 232011 when the bot is not in the chat).
    */

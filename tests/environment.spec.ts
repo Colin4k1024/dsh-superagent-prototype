@@ -184,3 +184,20 @@ describe('the repository the host\'s environment names', () => {
     } finally { vi.unstubAllEnvs() }
   })
 })
+
+describe('GitLab worker environment', () => {
+  it('shims glab, writes the GitLab host credential, and strips GitLab tokens from the worker', async () => {
+    const deployment = testDeployment({ stateDir: dir, github: { cli: '', login: '', noreply: '' },
+      forge: { kind: 'gitlab', repository: 'group/app', cli: join(dir, 'glab'), login: 'agent-bot', commitEmail: 'agent@example.com',
+        host: 'https://gitlab.example.com', projectId: 42 },
+      gitlab: { host: 'https://gitlab.example.com', project: 'group/app', projectId: 42, cli: join(dir, 'glab'), login: 'agent-bot', commitEmail: 'agent@example.com' } })
+    await writeEnvironment(deployment, [])
+    const bin = workerBin(dir)
+    expect(readdirSync(bin)).toEqual(expect.arrayContaining(['glab', 'lark-cli']))
+    expect(readdirSync(bin)).not.toContain('gh')
+    const config = readFileSync(workerGitConfig(dir), 'utf8')
+    expect(config).toContain('[credential "https://gitlab.example.com"]')
+    expect(config).toContain('auth git-credential')
+    expect(agentVariables(dir)).toMatchObject({ GITLAB_TOKEN: undefined, GLAB_CONFIG_DIR: undefined, CI_JOB_TOKEN: undefined })
+  })
+})
