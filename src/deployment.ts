@@ -46,13 +46,36 @@ export const GithubAccountsSchema = z.object({
   repository: z.string().trim().regex(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?$/, 'owner/name').default(''),
   cli: z.string().trim().default(''),
 })
+export const GitlabAccountsSchema = z.object({
+  host: z.string().trim().url('https://gitlab.com').default('https://gitlab.com').transform(value => value.replace(/\/+$/, '')),
+  project: z.string().trim().regex(/^([A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+$/, 'group/project').default(''),
+  cli: z.string().trim().default(''),
+  commitEmail: z.string().trim().email().or(z.literal('')).default(''),
+  mergeCli: z.string().trim().default(''),
+})
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
-export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
+export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape),
+  gitlab: Object.keys(GitlabAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
 
-export interface Deployment extends Machine {
+export type ForgeKind = 'github' | 'gitlab'
+/** The active code host: its canonical project path, CLI, account and commit email. */
+export interface ForgeAccount {
+  kind: ForgeKind
   repository: string
+  cli: string
+  login: string
+  commitEmail: string
+  host?: string
+  projectId?: number
+}
+export interface Deployment extends Machine {
+  /** The active code host's canonical project path, kept for callers that only need one repository. */
+  repository: string
+  forge: ForgeAccount
+  /** The GitHub account; placeholders while GitLab is the active code host. */
   github: { cli: string; login: string; noreply: string }
+  gitlab?: { host: string; project: string; projectId: number; cli: string; login: string; commitEmail: string; mergeCli?: string }
   feishu?: FeishuBot
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
@@ -84,7 +107,7 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   return result.success ? result.data : undefined
 }
 /** Verify the agent's GitHub CLI identity and push access to the configured repository. */
-export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+export async function resolveGithub(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
   const { stateDir } = machine
   const accounts = GithubAccountsSchema.parse(github ?? {})
   const remote = accounts.repository
@@ -102,7 +125,58 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   if (!access) throw new SetupError('repositoryUnreported', { repository: remote })
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
-  return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+  const noreply = `${agent.id}+${agent.login}@users.noreply.github.com`
+  return { ...machine, repository, forge: { kind: 'github', repository, cli, login: agent.login, commitEmail: noreply },
+    github: { cli, login: agent.login, noreply } }
+}
+/** The GitHub-only entry kept for callers that still name one code host explicitly. */
+export const resolveDeployment = resolveGithub
+
+const GitlabUser = z.object({ id: z.number().int().positive(), username: z.string().regex(/^[A-Za-z0-9_.-]+$/), email: z.string().email().nullish() })
+const GitlabProject = z.object({ id: z.number().int().positive(), path_with_namespace: z.string().regex(/^([A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+$/),
+  archived: z.boolean().optional(),
+  permissions: z.object({ project_access: z.object({ access_level: z.number().int() }).nullish(),
+    group_access: z.object({ access_level: z.number().int() }).nullish() }).nullish() })
+/** The minimum GitLab access level that can push to a project: Developer. */
+export const GITLAB_DEVELOPER = 30
+/** Verify the agent's glab identity and push access to the configured GitLab project. */
+export async function resolveGitlab(machine: Machine, gitlab: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+  const { stateDir } = machine
+  const accounts = GitlabAccountsSchema.parse(gitlab ?? {})
+  const project = accounts.project
+  if (!project) throw new SetupError('gitlabProjectUnset')
+  if (!accounts.cli) throw new SetupError('gitlabCliUnset')
+  let cli: string
+  try { cli = executable(accounts.cli, path, workerBin(stateDir)) } catch (error) { throw new SetupError('gitlabCliMissing', { output: reason(error) }) }
+  const agent = parsed(GitlabUser, await probe([cli, 'api', 'user']).catch((error: unknown) => {
+    throw new SetupError('gitlabCliSignedOut', { output: reason(error) })
+  }))
+  if (!agent) throw new SetupError('gitlabCliNoAccount')
+  const access = parsed(GitlabProject, await probe([cli, 'api', `projects/${encodeURIComponent(project)}`]).catch((error: unknown) => {
+    throw new SetupError('gitlabProjectUnreadable', { account: agent.username, project, output: reason(error) })
+  }))
+  if (!access) throw new SetupError('gitlabProjectUnreported', { project })
+  if (access.archived) throw new SetupError('gitlabProjectArchived', { project })
+  const level = Math.max(access.permissions?.project_access?.access_level ?? 0, access.permissions?.group_access?.access_level ?? 0)
+  if (level < GITLAB_DEVELOPER) throw new SetupError('gitlabProjectReadOnly', { account: agent.username, project })
+  let mergeCli: string | undefined
+  if (accounts.mergeCli) {
+    try { mergeCli = executable(accounts.mergeCli, path, workerBin(stateDir)) }
+    catch (error) { throw new SetupError('gitlabMergeCliMissing', { output: reason(error) }) }
+  }
+  const repository = access.path_with_namespace
+  const commitEmail = accounts.commitEmail || agent.email || ''
+  return { ...machine, repository, forge: { kind: 'gitlab', repository, cli, login: agent.username, commitEmail, host: accounts.host, projectId: access.id },
+    github: { cli: '', login: '', noreply: '' },
+    gitlab: { host: accounts.host, project: repository, projectId: access.id, cli, login: agent.username, commitEmail, ...mergeCli ? { mergeCli } : {} } }
+}
+/** Enabled code-host configurations, as the Setup reads them from the two Source blocks. */
+export interface CodeHostSources { github?: { enabled?: boolean; config?: unknown }; gitlab?: { enabled?: boolean; config?: unknown } }
+/** Resolve the one enabled code host; both enabled is refused instead of silently preferring one. */
+export async function resolveCodeHost(machine: Machine, sources: CodeHostSources, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+  if (sources.github?.enabled && sources.gitlab?.enabled) throw new SetupError('twoCodeHosts')
+  if (sources.gitlab?.enabled) return resolveGitlab(machine, sources.gitlab.config, probe, path)
+  return resolveGithub(machine, sources.github?.config, probe, path)
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })

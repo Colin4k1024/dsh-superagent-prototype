@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Config, executable, machineOf, resolveDeployment, resolveFeishuBot, type Machine, type Probe } from '../src/deployment.ts'
+import { Config, executable, machineOf, resolveCodeHost, resolveDeployment, resolveFeishuBot, resolveGitlab, type Machine, type Probe } from '../src/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
 
 const exec = promisify(execFile)
@@ -97,5 +97,41 @@ describe('setup', () => {
     await refuses('feishuNoBot')
     program(join(dir, 'bin', 'lark-cli'), 'echo "not configured" >&2; exit 1')
     await refuses('feishuCliFailed', { output: expect.stringContaining('not configured') })
+  })
+})
+
+describe('GitLab setup', () => {
+  /** Fake glab signed in as `login` with an access level on group/app. */
+  const glab = (file: string, login: string, level = 30, archived = false): string => program(file,
+    `case "$*" in\n  "api user") echo '{"id":9,"username":"${login}","email":"agent@example.com"}' ;;\n  "api projects/group%2Fapp") echo '{"id":42,"path_with_namespace":"group/app","archived":${archived},"permissions":{"project_access":{"access_level":${level}}}}' ;;\n  *) exit 1 ;;\nesac`)
+
+  it('reads the project and account from glab, strips a trailing slash from the host and defaults the commit email', async () => {
+    glab(join(dir, 'bin', 'glab'), 'Agent-Bot')
+    const deployment = await resolveGitlab(machine(), { host: 'https://gitlab.example.com/', project: 'group/app', cli: 'glab' }, probe, path)
+    expect(deployment).toMatchObject({ repository: 'group/app',
+      forge: { kind: 'gitlab', host: 'https://gitlab.example.com', projectId: 42, cli: join(dir, 'bin', 'glab'), login: 'Agent-Bot', commitEmail: 'agent@example.com' },
+      gitlab: { host: 'https://gitlab.example.com', project: 'group/app', projectId: 42, login: 'Agent-Bot' } })
+    expect(deployment.github).toEqual({ cli: '', login: '', noreply: '' })
+  })
+
+  it('names what GitLab setup needs and where it is set', async () => {
+    const needs = (code: string, values: Record<string, unknown>, gitlab: unknown) =>
+      expect(resolveGitlab(machine(), gitlab, probe, path)).rejects.toEqual(setupError('gitlab', code, values))
+    await needs('gitlabProjectUnset', {}, { cli: 'glab' })
+    await needs('gitlabCliUnset', {}, { project: 'group/app' })
+    await needs('gitlabCliMissing', { output: `${join(dir, 'missing')} is not an executable file` }, { project: 'group/app', cli: join(dir, 'missing') })
+    await needs('gitlabCliSignedOut', {}, { project: 'group/app', cli: program(join(dir, 'bin', 'glab-broken'), 'exit 1') })
+    glab(join(dir, 'bin', 'glab-reader'), 'Agent-Bot', 20)
+    await needs('gitlabProjectReadOnly', { account: 'Agent-Bot', project: 'group/app' }, { project: 'group/app', cli: 'glab-reader' })
+    glab(join(dir, 'bin', 'glab-archived'), 'Agent-Bot', 30, true)
+    await needs('gitlabProjectArchived', { project: 'group/app' }, { project: 'group/app', cli: 'glab-archived' })
+  })
+
+  it('refuses two enabled code hosts and resolves the one that is enabled', async () => {
+    glab(join(dir, 'bin', 'glab'), 'Agent-Bot')
+    await expect(resolveCodeHost(machine(), { github: { enabled: true, config: {} }, gitlab: { enabled: true, config: {} } }, probe, path))
+      .rejects.toMatchObject({ code: 'twoCodeHosts' })
+    expect(await resolveCodeHost(machine(), { github: { enabled: false }, gitlab: { enabled: true, config: { project: 'group/app', cli: 'glab' } } }, probe, path))
+      .toMatchObject({ forge: { kind: 'gitlab', projectId: 42 } })
   })
 })
