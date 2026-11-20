@@ -1,0 +1,11 @@
+# Copy to `.gitlab/scripts/review-gate.mjs` and `.gitlab/review-gate.json`, then add this job to `.gitlab-ci.yml`.
+# Enable "Pipelines must succeed" on the protected default branch; the job alone cannot block a merge without it.
+review-gate:
+  image: node:22
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    GITLAB_TOKEN: $REVIEW_GATE_TOKEN
+  script:
+    - node .gitlab/scripts/review-gate.mjs
+  allow_failure: false

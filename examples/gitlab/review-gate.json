@@ -1,0 +1,7 @@
+{
+  "maxLines": 200,
+  "sensitivePaths": [
+    "**/auth/**", "**/oauth/**", "**/audit/**", "**/policy/**", "**/approval/**",
+    "**/isolation/**", "**/binding*", "**/migrations/**", "**/*secret*", "**/*credential*"
+  ]
+}
