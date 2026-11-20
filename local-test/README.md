@@ -45,6 +45,33 @@ Observed on 2026-11-20: the fake API flow captured **3/3** canary mentions, late
 (p95 61.3s, target <120s); the worker replied on issue #7 with the `dsh-superagent:` marker and the ticket ended
 `completed`. A note posted as the agent itself is ignored, as it should be.
 
+## 3. Internal GitLab (`hgit.haier.net`)
+
+The host is already in `glab auth status` (user `fanjia`, token in the OS keyring), but it only resolves on the corporate
+network/VPN. First check:
+
+```sh
+glab api version --hostname hgit.haier.net
+glab api "projects/<group>%2F<project>" --hostname hgit.haier.net
+```
+
+Then point the profile at it:
+
+```sh
+export GITLAB_HOST=https://hgit.haier.net
+export GITLAB_PROJECT=group/subgroup/project
+export GITLAB_ALLOWED=fanjia
+# optional: a separate Maintainer glab wrapper for the host merge tool
+# export GITLAB_MERGE_CLI=/path/to/glab-maintainer
+python3 local-test/configure-internal.py
+```
+
+The script checks project access (Developer or higher), reads the GitLab user/email, saves the Source and the allowed
+policy originators, and leaves `mergeCli` empty unless you name one. It never prints or stores the token.
+
+A project access token for a dedicated agent is still preferable to the operator's token; see the GitLab section of
+`docs/006-deployment.md`.
+
 ## What this does and does not prove
 
 - Proves: setup probing, GitLab API transport, polling, Trigger/Thread translation, policy gate, main-Session routing,
