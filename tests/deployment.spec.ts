@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Config, executable, machineOf, resolveCodeHost, resolveDeployment, resolveFeishuBot, resolveGitlab, type Machine, type Probe } from '../src/deployment.ts'
+import { Config, GitlabAccountsSchema, executable, machineOf, resolveCodeHost, resolveDeployment, resolveFeishuBot, resolveGitlab, type Machine, type Probe } from '../src/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
 
 const exec = promisify(execFile)
@@ -40,6 +40,10 @@ afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 vi.setConfig({ testTimeout: 30_000 })
 
 describe('configuration schema', () => {
+  it('accepts an unset GitLab project until setup names one', () => {
+    expect(GitlabAccountsSchema.parse({}).project).toBe('')
+    expect(GitlabAccountsSchema.parse({ project: 'group/app' }).project).toBe('group/app')
+  })
   it('requires only the state directory and reads the editable fields through references', () => {
     expect(() => Config({})).toThrow('stateDir')
     const read = machineOf(Config({ stateDir: join(dir, 'state') }))

@@ -48,7 +48,7 @@ export const GithubAccountsSchema = z.object({
 })
 export const GitlabAccountsSchema = z.object({
   host: z.string().trim().url('https://gitlab.com').default('https://gitlab.com').transform(value => value.replace(/\/+$/, '')),
-  project: z.string().trim().regex(/^([A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+$/, 'group/project').default(''),
+  project: z.string().trim().regex(/^$|^([A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+$/, 'group/project').default(''),
   cli: z.string().trim().default(''),
   commitEmail: z.string().trim().email().or(z.literal('')).default(''),
   mergeCli: z.string().trim().default(''),
