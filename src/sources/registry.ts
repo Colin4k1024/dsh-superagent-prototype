@@ -3,7 +3,8 @@ import type { ChannelRef, OutboundMessage, ScopeResult, SourceScope, Trigger } f
 import type { Commands } from '../infra/commands.ts'
 import { HealthBoard, type HealthEntry } from '../infra/health.ts'
 import { AdmissionTableSchema, type Settings } from '../policy.ts'
-import type { ChannelLink, ChannelLinks, SourceInstance, SourceKind, TriggerContext, VariableSpec } from './kind.ts'
+import type { ChannelLink, ChannelLinks, SourceCapabilities, SourceInstance, SourceKind, TriggerContext, VariableSpec } from './kind.ts'
+import type { ForgePort } from './forge.ts'
 
 
 /**
@@ -41,6 +42,15 @@ export class SourceRegistry implements SourceScope {
     return new Map(names.flatMap(name => { const entry = this.health.get(name); return entry ? [[name, entry] as const] : [] }))
   }
   kind(id: string): SourceKind | undefined { return this.kinds.get(id) }
+  /** What an installed kind publishes to the generic layer, such as its code-host capability; undefined for an unknown kind. */
+  capabilities(source: string): SourceCapabilities | undefined { return this.kinds.get(source)?.capabilities }
+  /** The code-host capability of one Source, or undefined for a Source without one or one not installed. */
+  forgeOf(source: string): ForgePort | undefined { return this.capabilities(source)?.forge }
+  /** Every installed kind that publishes a code-host capability, in kind-id order. */
+  forges(): { source: string; forge: ForgePort }[] {
+    return [...this.kinds.values()].sort((a, b) => a.kind.localeCompare(b.kind))
+      .flatMap(kind => kind.capabilities?.forge ? [{ source: kind.kind, forge: kind.capabilities.forge }] : [])
+  }
   /** Every registered kind's instance ordered by ID, followed by stored instances whose kind is not installed (with their config kept as stored). */
   instances(settings = this.settings()): (SourceInstance & { installed: boolean })[] {
     const installed = [...this.kinds.values()].sort((a, b) => a.kind.localeCompare(b.kind)).map(kind => ({ ...this.resolve(kind, settings.sources[kind.kind]), installed: true }))
