@@ -1,0 +1,19 @@
+{
+  "maxLines": 200,
+  "sensitivePaths": [
+    "apps/gateway/src/oauth.rs",
+    "apps/gateway/src/auth/**",
+    "crates/audit/**",
+    "crates/policy/**",
+    "crates/domain/src/context.rs",
+    "crates/persistence/migrations/**",
+    "services/browser-worker/src/binding*",
+    "**/auth/**",
+    "**/oauth/**",
+    "**/audit/**",
+    "**/policy/**",
+    "**/approval/**",
+    "**/isolation/**",
+    "**/migrations/**"
+  ]
+}

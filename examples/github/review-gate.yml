@@ -1,0 +1,33 @@
+# Required status check for agent-authored pull requests. Copy to `.github/workflows/review-gate.yml`.
+# Install the matching script at `.github/scripts/review-gate.mjs` and config at `.github/review-gate.json`.
+# Enable branch protection (or a ruleset) on the default branch with this check required; see docs/009-review-gate.md.
+name: review-gate
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  pull_request_review:
+    types: [submitted, dismissed]
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: review-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  review-gate:
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check approvals, size and sensitive paths
+        run: node .github/scripts/review-gate.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}

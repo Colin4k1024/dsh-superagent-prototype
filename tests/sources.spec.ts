@@ -655,7 +655,7 @@ describe('github source', () => {
     expect(h.health.github).toMatchObject({ state: 'ready', detail: '2 notifications; next poll ≥ 120s' })
     h.store.close()
   })
-  it('drops a notified Issue whose reads fail for a day, so the Source leaves the error, and keeps its read position', async () => {
+  it('quarantines a notified Issue after repeated 404s, then resumes it when a new mention proves it readable', async () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
     h.store.threads.save({ key: 'github:16', ref: { source: 'github', id: '16' }, createdAt: '', subscriptions: [], correlated: [], pending: [],
@@ -665,19 +665,64 @@ describe('github source', () => {
     await expect(pollRound(h)).rejects.toThrow('#16: Error: gh: Not Found (HTTP 404)')
     const first = h.store.get<Record<string, { failedAt: string; attempts: number }>>('github-retry')![16]!
     expect(first).toMatchObject({ attempts: 1, failedAt: expect.any(String) })
-    // However many reads failed, a day of failures has not passed: the read is retried, and the round still fails.
-    h.store.set('github-retry', { 16: { ...first, attempts: 99 } })
+    // The second failed read is retried, the third quarantines the Thread instead of failing the whole Source forever.
+    h.store.set('github-retry', { 16: { ...first, attempts: 2 } })
     github(h, { notifications: [] })
-    await expect(pollRound(h)).rejects.toThrow('#16')
-    // A day after the first failed read, it is dropped: its Thread keeps the error, the health names it, and the round does not
-    // fail. Its read position stays, so a later read takes in what the failed reads missed.
-    h.store.set('github-retry', { 16: { ...first, failedAt: new Date(Date.now() - 25 * 3600_000).toISOString() } })
     await pollRound(h)
     expect(h.store.get('github-retry')).toEqual({})
-    expect(h.store.get('github-cursor:16')).toBe('2026-09-01T00:00:00.000Z')
-    expect(h.store.threads.get('github:16')?.meta.pollError).toContain('Not Found')
+    expect(h.store.threads.get('github:16')!.meta).toMatchObject({ pollError: expect.stringContaining('Not Found'), pollSuspended: true })
     expect(h.health.github).toMatchObject({ state: 'ready',
-      detail: '0 notifications; next poll ≥ 60s; dropped after their reads kept failing: #16' })
+      detail: '0 notifications; next poll ≥ 60s; quarantined after repeated reads failed: #16' })
+    // A later human mention is read normally and lifts the quarantine.
+    h.store.set('github-since', '2026-09-08T00:00:00.000Z')
+    github(h, { notifications: [notification(16)], 'issues/16': issue(16, { created_at: '2026-08-01T00:00:00Z' }),
+      'issues/16/comments': [{ id: 7, body: '@agent-bot still here?', user: { login: 'alice', type: 'User' },
+        created_at: '2026-09-08T01:00:00Z', updated_at: '2026-09-08T01:00:00Z' }] })
+    await pollRound(h)
+    expect(h.store.threads.get('github:16')!.meta).not.toHaveProperty('pollSuspended')
+    expect(h.receive).toHaveBeenCalledWith(expect.objectContaining({ text: '@agent-bot still here?' }))
+    h.store.close()
+  })
+  it('drops a notified Issue after a day of non-404 failures, so the Source leaves the error, and keeps its read position', async () => {
+    const h = host()
+    h.store.set('github-since', '2026-09-08T00:00:00.000Z')
+    h.store.threads.save({ key: 'github:17', ref: { source: 'github', id: '17' }, createdAt: '', subscriptions: [], correlated: [], pending: [],
+      meta: {} })
+    h.store.set('github-cursor:17', '2026-09-01T00:00:00.000Z')
+    github(h, { notifications: [notification(17)], 'issues/17': refused(502, 'Bad Gateway') })
+    await expect(pollRound(h)).rejects.toThrow('#17: Error: gh: Bad Gateway (HTTP 502)')
+    const first = h.store.get<Record<string, { failedAt: string; attempts: number }>>('github-retry')![17]!
+    expect(first).toMatchObject({ attempts: 1, failedAt: expect.any(String) })
+    // A day after the first failed read, it is dropped: its Thread keeps the error, the health names it, and the round does not
+    // fail. Its read position stays, so a later read takes in what the failed reads missed.
+    h.store.set('github-retry', { 17: { ...first, failedAt: new Date(Date.now() - 25 * 3600_000).toISOString() } })
+    github(h, { notifications: [], 'issues/17': refused(502, 'Bad Gateway') })
+    await pollRound(h)
+    expect(h.store.get('github-retry')).toEqual({})
+    expect(h.store.get('github-cursor:17')).toBe('2026-09-01T00:00:00.000Z')
+    expect(h.store.threads.get('github:17')?.meta.pollError).toContain('Bad Gateway')
+    expect(h.health.github).toMatchObject({ state: 'ready',
+      detail: '0 notifications; next poll ≥ 60s; dropped after their reads kept failing: #17' })
+    h.store.close()
+  })
+  it('quarantines a subscribed Thread after repeated 404s instead of failing every poll forever', async () => {
+    const h = host()
+    h.store.tickets.save(openTicket('t18'))
+    h.store.threads.save({ key: 'github:18', ref: { source: 'github', id: '18' }, createdAt: '', lastAt: new Date().toISOString(),
+      subscriptions: ['t18'], correlated: [], pending: [], meta: { number: 18, isPr: false, title: 'Gone' } })
+    github(h, { notifications: [], 'issues/18/comments': refused(404, 'Not Found') })
+    await expect(pollRound(h)).rejects.toThrow('github:18: Error: gh: Not Found (HTTP 404)')
+    await expect(pollRound(h)).rejects.toThrow('github:18: Error: gh: Not Found (HTTP 404)')
+    // The third consecutive 404 quarantines the Thread; the round is ready and the health names it once.
+    await pollRound(h)
+    expect(h.store.threads.get('github:18')!.meta).toMatchObject({ pollSuspended: true, pollFailures: 3 })
+    expect(h.health.github).toMatchObject({ state: 'ready',
+      detail: '0 notifications; next poll ≥ 60s; quarantined after repeated reads failed: #18' })
+    // A newer human Trigger makes it readable again; a successful read clears the quarantine.
+    h.store.threads.save({ ...h.store.threads.get('github:18')!, lastAt: new Date(Date.now() + 1000).toISOString() })
+    github(h, { notifications: [], 'issues/18/comments': [] })
+    await pollRound(h)
+    expect(h.store.threads.get('github:18')!.meta).not.toHaveProperty('pollSuspended')
     h.store.close()
   })
   it('polls the PRs of open tickets and subscribed Threads although the notifications fail, and then fails the round', async () => {
@@ -782,7 +827,9 @@ describe('github source', () => {
       // Rounds fail, succeed, fail, fail: only the last two in a row make the error. A round reads through a Commands of its own.
       const outcomes = [false, true, false, false]
       let round = 0
-      const run = vi.spyOn(Commands.prototype, 'run').mockImplementation(async () => {
+      const run = vi.spyOn(Commands.prototype, 'run').mockImplementation(async (_program, args) => {
+        // The mention sweep reads two more endpoints per round; only the notification read advances this test's round.
+        if (!args[1]!.startsWith('repos/acme/widgets/notifications')) return 'HTTP/2.0 200 OK\r\n\r\n[]'
         if (!outcomes[round++]) throw refused(502, 'Bad Gateway')
         return 'HTTP/2.0 200 OK\r\n\r\n[]'
       })
@@ -860,7 +907,7 @@ describe('github source', () => {
     expect(h.receive.mock.calls.map(([trigger]) => trigger)).toEqual([expected])
     // An Issue has only its conversation; the comments are read since the notification cursor.
     const since = encodeURIComponent('2026-09-08T00:00:00.000Z')
-    expect(reads.filter(path => path.includes('/comments'))).toEqual([`issues/12/comments?per_page=100&since=${since}`])
+    expect(reads.filter(path => path.startsWith('issues/12/comments'))).toEqual([`issues/12/comments?per_page=100&since=${since}`])
     h.store.close()
   })
   it('keeps one body Trigger for an Issue that a later poll reads again', async () => {
@@ -920,7 +967,8 @@ describe('github source', () => {
       'pulls/9': { title: 'Fix', state: 'open', html_url: 'https://github.com/acme/widgets/pull/9', user: { login: 'carol' },
         head: { sha: 'abc', ref: 'fix', repo: null } } })
     await pollRound(h)
-    expect(bare(reads)).toEqual(['notifications', 'issues/9', 'pulls/9', 'issues/9/comments', 'pulls/9/comments', 'pulls/9/reviews'])
+    expect(bare(reads)).toEqual(['notifications', 'issues/9', 'pulls/9', 'issues/9/comments', 'pulls/9/comments', 'pulls/9/reviews',
+      'issues/comments', 'pulls/comments'])
     expect(h.receive.mock.calls.map(([trigger]) => trigger)).toEqual([expect.objectContaining({ text: 'APPROVED review of commit abc',
       meta: expect.objectContaining({ isPr: true }) })])
     h.store.close()
@@ -1023,8 +1071,8 @@ it('reports GitHub as failing only after the configured number of consecutive fa
   expect(pollFailure(1, 3, eof)).toBeUndefined()
   expect(pollFailure(2, 3, eof)).toBeUndefined()
   expect(pollFailure(3, 3, eof)).toEqual({ state: 'error', detail: '3 consecutive failed polls; last: Error: Get "https://api.github.com/x": EOF', code: 'pollFailures', values: { count: '3', error: 'Error: Get "https://api.github.com/x": EOF' } })
-  expect(githubKind.schema.parse({})).toEqual({ repository: '', cli: '', pollSeconds: 60, failuresBeforeError: 3, observeIssues: false,
-    observePulls: false, observeComments: false, observeCi: false })
+  expect(githubKind.schema.parse({})).toEqual({ repository: '', cli: '', pollSeconds: 60, failuresBeforeError: 3, mentionLookbackSeconds: 900,
+    threadFailuresBeforeQuarantine: 3, observeIssues: false, observePulls: false, observeComments: false, observeCi: false })
 })
 describe('feishu event consumer', () => {
   let dir: string
@@ -1264,6 +1312,21 @@ describe('observing the GitHub repository', () => {
     await pollRound(h)
     expect(h.receive.mock.calls.map(([trigger]) => [trigger.meta.number, trigger.meta.isPr, trigger.meta.kind, trigger.human]))
       .toEqual([[7, false, 'conversation', true], [9, true, 'conversation', false], [9, true, 'inline', true]])
+    h.store.close()
+  })
+  it('sweeps recent repository comments for mentions when notifications are lost, and ignores non-mentions', async () => {
+    const h = host()
+    observe(h, {})
+    const recent = new Date(Date.now() - 60_000).toISOString()
+    const comment = (id: number, body: string, login = 'carol') => ({ id, body, user: { login, type: 'User' },
+      issue_url: 'https://api.github.com/repos/acme/widgets/issues/7',
+      html_url: `https://github.com/acme/widgets/issues/7#issuecomment-${id}`, created_at: recent, updated_at: recent })
+    github(h, { notifications: [], 'issues/comments': [comment(1, '@agent-bot please take this'), comment(2, 'just a note'),
+      comment(3, '@agent-bot from the agent', 'agent-bot')] })
+    await pollRound(h)
+    expect(h.receive).toHaveBeenCalledTimes(1)
+    expect(h.receive).toHaveBeenCalledWith(expect.objectContaining({ text: '@agent-bot please take this', addressed: 'mention',
+      meta: expect.objectContaining({ number: 7, isPr: false, kind: 'conversation' }) }))
     h.store.close()
   })
   it('fails the round for a stream whose read fails, keeps its cursor, and still reads the other streams', async () => {
