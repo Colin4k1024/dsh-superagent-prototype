@@ -63,9 +63,9 @@ export const readPipeline = (commands: Commands, id: number): Promise<z.infer<ty
 /** The jobs of one pipeline, with their names, statuses and `allow_failure`. */
 export const readJobs = (commands: Commands, id: number): Promise<z.infer<typeof GitlabJobSchema>[]> =>
   commands.gitlabPages(GitlabJobSchema, `pipelines/${id}/jobs?per_page=100`)
-/** The newest pipeline of a ref, if any. */
+/** The newest pipeline of a ref, if any. Read one page directly (no `--paginate`, which would walk the whole history). */
 export const readLatestPipeline = async (commands: Commands, ref: string): Promise<z.infer<typeof GitlabPipelineSchema> | undefined> =>
-  (await commands.gitlabPages(GitlabPipelineSchema, `pipelines?ref=${encodeURIComponent(ref)}&per_page=1`))[0]
+  (await commands.gitlab(z.array(GitlabPipelineSchema), `pipelines?ref=${encodeURIComponent(ref)}&order_by=id&sort=desc&per_page=1`))[0]
 
 /** A CI snapshot: the overall status and each job; `allow_failure` jobs do not fail the snapshot. */
 export interface CiSnapshot { status: string; jobs: { name: string; status: string; allowFailure: boolean }[] }

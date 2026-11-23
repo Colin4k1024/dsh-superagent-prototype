@@ -46,6 +46,43 @@ export function validItems<T>(item: z.ZodType<T>, list: readonly unknown[], tall
   if (tally) tally.skipped += list.length - items.length
   return items
 }
+/**
+ * Parses `glab api --paginate` output, which concatenates each page's JSON array as `[...][...]` instead of merging
+ * them into one flat array (unlike `gh`, which merges pages under `--slurp`). Each top-level array is decoded on its
+ * own boundary so a `][` sequence inside a string value (a note body, for example) is left untouched.
+ */
+export function mergedGitlabPages(output: string): unknown[] {
+  const text = output.trim()
+  const items: unknown[] = []
+  let index = 0
+  while (index < text.length) {
+    while (index < text.length && /\s/.test(text.charAt(index))) index += 1
+    if (index >= text.length) break
+    const end = endOfTopLevelValue(text, index)
+    const value: unknown = JSON.parse(text.slice(index, end))
+    if (!Array.isArray(value)) throw new Error(`glab --paginate returned a non-array page at offset ${index}`)
+    items.push(...value)
+    index = end
+  }
+  return items
+}
+/** Byte offset just past the JSON value at `start`, tracking strings, escapes, and `{}`/`[]` nesting. */
+function endOfTopLevelValue(text: string, start: number): number {
+  let depth = 0, inString = false, escaped = false
+  for (let i = start; i < text.length; i += 1) {
+    const char = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') { inString = true; continue }
+    if (char === '{' || char === '[') { depth += 1; continue }
+    if (char === '}' || char === ']') { depth -= 1; if (depth === 0) return i + 1 }
+  }
+  return text.length
+}
 /** Rewrites Feishu error 232011 (bot not in chat) with remediation instructions. */
 function membership(error: unknown): unknown {
   if (!(error instanceof CliError) || error.code !== 232011) return error
@@ -108,10 +145,10 @@ export class Commands {
     const [path = '', ...flags] = rest
     return schema.parse(JSON.parse(await this.run(this.deployment.forge.cli, ['api', this.gitlabPath(path), ...flags])))
   }
-  /** Fetches all pages of a GitLab API list, whose `--paginate` output is one flat JSON array. */
+  /** Fetches all pages of a GitLab API list, re-merging glab's concatenated per-page JSON arrays. */
   async gitlabPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
     const output = await this.run(this.deployment.forge.cli, ['api', this.gitlabPath(path), '--paginate'])
-    return validItems(item, z.array(z.unknown()).parse(JSON.parse(output)), tally)
+    return validItems(item, mergedGitlabPages(output), tally)
   }
   /** Calls a GitLab API path outside the project, such as `todos`, `user` or `events`, with the same validation. */
   async gitlabRoot<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
@@ -124,7 +161,7 @@ export class Commands {
   /** Fetches all pages of a root GitLab list, such as the pending todos. */
   async gitlabRootPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
     const output = await this.run(this.deployment.forge.cli, ['api', this.rootPath(path), '--paginate'])
-    return validItems(item, z.array(z.unknown()).parse(JSON.parse(output)), tally)
+    return validItems(item, mergedGitlabPages(output), tally)
   }
   private rootPath(path: string): string {
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)

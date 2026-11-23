@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
-import { CliError, Commands, commandError } from '../src/infra/commands.ts'
+import { CliError, Commands, commandError, mergedGitlabPages } from '../src/infra/commands.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { feishuChannel } from '../src/sources/feishu-trigger.ts'
 import { githubKind } from '../src/sources/github.ts'
@@ -230,5 +230,36 @@ describe('GitLab API transport', () => {
     expect(await commands.gitlab(z.object({ iid: z.number() }), 'merge_requests/7')).toEqual({ iid: 7 })
     expect(run).toHaveBeenLastCalledWith('/path/glab', ['api', 'projects/42/merge_requests/7'])
     await expect(commands.gitlab('projects/../x')).rejects.toThrow('restricted to the configured project')
+  })
+
+  it('re-merges glab concatenated page arrays and still skips items that fail validation', async () => {
+    const commands = new Commands(() => gitlabDeployment, {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('[{ "iid": 1 }]\n[{ "iid": 2 }, { "iid": "three" }]')
+    const tally = { skipped: 0 }
+    expect(await commands.gitlabPages(z.object({ iid: z.number() }), 'issues?per_page=1', tally)).toEqual([{ iid: 1 }, { iid: 2 }])
+    expect(tally).toEqual({ skipped: 1 })
+    expect(run).toHaveBeenCalledWith('/path/glab', ['api', 'projects/42/issues?per_page=1', '--paginate'])
+  })
+
+  it('read only the newest pipeline without --paginate walking the whole history', async () => {
+    const commands = new Commands(() => gitlabDeployment, {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('[{"id":422571,"status":"success"},{"id":380333,"status":"failed"}]')
+    const { readLatestPipeline } = await import('../src/sources/gitlab-read.ts')
+    expect(await readLatestPipeline(commands, 'master')).toEqual({ id: 422571, status: 'success' })
+    expect(run).toHaveBeenCalledWith('/path/glab', ['api', 'projects/42/pipelines?ref=master&order_by=id&sort=desc&per_page=1'])
+  })
+})
+
+describe('mergedGitlabPages', () => {
+  it('merges concatenated page arrays separated by whitespace', () => {
+    expect(mergedGitlabPages('[{ "iid": 1 }]\n[{ "iid": 2 }, { "iid": 3 }]')).toEqual([{ iid: 1 }, { iid: 2 }, { iid: 3 }])
+    expect(mergedGitlabPages('[]')).toEqual([])
+  })
+  it('leaves a `][` sequence inside a string value untouched', () => {
+    expect(mergedGitlabPages('[{"body":"a]\\n[b","iid":1}]')).toEqual([{ body: 'a]\n[b', iid: 1 }])
+  })
+  it('tolerates nested arrays and objects within one page', () => {
+    expect(mergedGitlabPages('[{"tags":["a","b"],"meta":{"x":[1,2]}}][{"iid":2}]')).toEqual([
+      { tags: ['a', 'b'], meta: { x: [1, 2] } }, { iid: 2 }])
   })
 })
