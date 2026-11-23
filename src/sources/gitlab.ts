@@ -251,18 +251,18 @@ async function pollOpenChanges(ctx: SourceContext, commands: SourceContext['comm
   }
 }
 
-/** New approvers become Triggers; a revoked approval is simply removed from the known set. */
-async function pollApprovals(ctx: SourceContext, commands: SourceContext['commands'], number: number,
+/** New approvers become Triggers; a revoked approval is simply removed from the known set. The first observation also
+ *  emits approvals already present, because a fast approval can land after an MR binds to its ticket but before the first
+ *  poll — treating it as a silent baseline would leave a worker waiting for a review that already exists. `previous` stores
+ *  only usernames, so a repeat observation after a restart is still deduplicated. */
+export async function pollApprovals(ctx: SourceContext, commands: SourceContext['commands'], number: number,
   mr: Awaited<ReturnType<typeof readMergeRequest>>, round: GitlabRound): Promise<void> {
   const approvals = await readApprovals(commands, number)
   const users = approvals.approved_by.map(item => item.user)
-  const previous = ctx.state.get(KV.gitlab.approvals(number))
-  // The first observation is a baseline; only approvals after it are events.
-  if (previous !== undefined) {
-    for (const user of users) {
-      if (previous.includes(user.username)) continue
-      await ctx.receive(approvalTrigger(mr, user)); round.received += 1
-    }
+  const previous = ctx.state.get(KV.gitlab.approvals(number)) ?? []
+  for (const user of users) {
+    if (previous.includes(user.username)) continue
+    await ctx.receive(approvalTrigger(mr, user)); round.received += 1
   }
   ctx.state.set(KV.gitlab.approvals(number), users.map(user => user.username))
 }

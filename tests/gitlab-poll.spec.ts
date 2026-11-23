@@ -5,7 +5,7 @@ import type { Commands } from '../src/infra/commands.ts'
 import type { Trigger } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import { readIssues, readNotes, readTodos } from '../src/sources/gitlab-read.ts'
-import { pollRound } from '../src/sources/gitlab.ts'
+import { pollApprovals, pollRound } from '../src/sources/gitlab.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 
 const deployment = testDeployment({ github: { cli: '', login: '', noreply: '' },
@@ -56,5 +56,44 @@ describe('GitLab polling round', () => {
     // The second round reads the same page; deterministic Trigger ids make receive a no-op in production, so the test's collector sees them again.
     await pollRound(ctx, new AbortController().signal)
     expect(received).toHaveLength(4)
+  })
+})
+
+describe('GitLab approval polling', () => {
+  const approver = (username: string, id: number) => ({ id, username, bot: false })
+  const mr = { iid: 12, web_url: 'https://gitlab.example.com/group/app/-/merge_requests/12' } as Parameters<typeof pollApprovals>[3]
+  const round = () => ({ started: new Date().toISOString(), received: 0 })
+  const ctxOf = (received: Trigger[], state: Map<string, unknown>) => ({ receive: async (trigger: Trigger) => { received.push(trigger); return 'stored' },
+    state: { get: (key: string) => state.get(key), set: (key: string, value: unknown) => { value === undefined ? state.delete(key) : state.set(key, value) } } } as unknown as SourceContext)
+
+  it('emits approvals already present on the first observation, then deduplicates the second round', async () => {
+    const commands = { gitlab: vi.fn(async () => ({ approved_by: [{ user: approver('fanjia', 2548) }] })) } as unknown as Commands
+    const received: Trigger[] = []
+    const state = new Map<string, unknown>()
+    const ctx = ctxOf(received, state)
+    const first = round()
+    await pollApprovals(ctx, commands, 12, mr, first)
+    expect(first.received).toBe(1)
+    expect(received).toHaveLength(1)
+    expect(received[0]!.human).toBe(true)
+    expect(received[0]!.meta).toMatchObject({ item: 'mr', iid: 12, event: 'approval', approver: 'fanjia' })
+    expect(state.get(KV.gitlab.approvals(12))).toEqual(['fanjia'])
+    // A second observation of the same approval is not a new event.
+    const second = round()
+    await pollApprovals(ctx, commands, 12, mr, second)
+    expect(second.received).toBe(0)
+    expect(received).toHaveLength(1)
+  })
+
+  it('emits only approvers not already in the recorded set', async () => {
+    const commands = { gitlab: vi.fn(async () => ({ approved_by: [{ user: approver('fanjia', 2548) }, { user: approver('bob', 9) }] })) } as unknown as Commands
+    const received: Trigger[] = []
+    const state = new Map<string, unknown>([[KV.gitlab.approvals(12), ['fanjia']]])
+    const ctx = ctxOf(received, state)
+    const once = round()
+    await pollApprovals(ctx, commands, 12, mr, once)
+    expect(once.received).toBe(1)
+    expect(received.map(item => item.meta.approver)).toEqual(['bob'])
+    expect(state.get(KV.gitlab.approvals(12))).toEqual(['fanjia', 'bob'])
   })
 })
