@@ -16,8 +16,9 @@ HOST = os.environ.get('GITLAB_HOST', 'https://hgit.haier.net').rstrip('/')
 PROJECT = os.environ.get('GITLAB_PROJECT', '').strip()
 CLI = os.environ.get('GITLAB_CLI') or shutil.which('glab') or ''
 MERGE = os.environ.get('GITLAB_MERGE_CLI', '').strip()
-BASE = 'http://127.0.0.1:3083'
-HEADERS = {'Host': '127.0.0.1:3083', 'X-Orchestrator-Request': '1', 'Origin': BASE, 'content-type': 'application/json'}
+BASE = os.environ.get('GITLAB_BASE', 'http://127.0.0.1:3083').rstrip('/')
+HOST_HEADER = urllib.parse.urlparse(BASE).netloc or '127.0.0.1:3083'
+HEADERS = {'Host': HOST_HEADER, 'X-Orchestrator-Request': '1', 'Origin': BASE, 'content-type': 'application/json'}
 
 def fail(message):
     print(f'error: {message}', file=sys.stderr); sys.exit(1)
