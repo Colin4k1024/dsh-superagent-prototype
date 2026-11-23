@@ -10,7 +10,7 @@
 | P-1 PAT 轮换与密钥加固 | 🟢 已轮换（到期 2027-11-23）+ 存储定为「保明文 + 600」 | §2 SOP + §7 周巡检 automation |
 | P-2 Runner/CI 可用性监控 | 🟢 可操作 | `scripts/gitlab-runner-check.sh` + 周巡检 automation |
 | P-3 门禁与审批策略评审 | 🟢 评审结论：保持默认 | §5（`src/app/merge-gate.ts` 已实现） |
-| P-4 测试内绝对路径硬化 | 🟡 可选（当前不红） | §6 |
+| P-4 测试内绝对路径硬化 | 🟢 已合入（MR !31，`shutil.which`） | §6 |
 
 ## 1. 现状清单（两套在线部署，均已走通完整闭环）
 
@@ -99,10 +99,13 @@ scripts/gitlab-runner-check.sh 17286
 
 不引入项目级覆盖；如需按仓库定制敏感路径或审批阈值，再单独变更。
 
-## 6. 代码内绝对路径硬化（立项 P-4，低优先级）
+## 6. 代码内绝对路径硬化（立项 P-4，已合入）
 
-已修：`/bin/kill` → `os.kill`（`agent-runtime` 基线修复）。
-残余：`management/tests/unit_tests/test_reconcile.py` 三处 `/bin/sleep`（coreutils 存在、当前不红，但属脆弱点）。可选：改成 `shutil.which("sleep")` 或 `sys.executable` 派生。
+已修（`agent-runtime`）：
+- `/bin/kill` → `os.kill`（基线修复，MR !28）。
+- `/bin/sleep` → `shutil.which("sleep")` 解析一次 + `_spawn_sleep` 辅助（MR !31，测试 `test_reconcile.py` 三处）。
+
+> 已全仓核对：`foundation/` `management/` `server/` 内不再有硬编码系统二进制绝对路径（`/bin/`、`/usr/bin/` 等）。
 
 ## 7. 定时任务（自动化巡检）
 
